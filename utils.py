@@ -1,4 +1,6 @@
 from PIL import Image, ImageFilter, ImageOps, ImageChops
+import random
+from typing import Tuple
 
 def resize_match_ref_height_and_crop(base: Image.Image,
                                      ref: Image.Image,
@@ -467,3 +469,149 @@ def save_tiles(out, tiles, folder='tiles', mask_mode='grey_watermark', split_col
                 k += 1
 
         canvas.save(f"{folder}/grey6.png")
+
+
+def create_random_white_mask(
+    black_bg: Image.Image,               # ex: Image.new("RGBA", base.size, (0,0,0,255))
+    whited: Image.Image,                 # mask « blanc » (ou n’importe quelle image -> on prend sa luminance)
+    n: int = 8,
+    scale_range: Tuple[float, float] = (0.6, 1.3),   # facteur d'échelle min/max
+    angle_range: Tuple[float, float] = (-20.0, 20.0),# rotation aléatoire (degrés)
+    threshold: int | None = None,        # None = niveaux de gris; sinon binaire (>=t -> opaque)
+    feather_edge: float = 0.0,           # lisser le bord (flou gaussien sur l’alpha)
+    resample_scale = Image.Resampling.LANCZOS,
+    resample_rotate = Image.Resampling.BICUBIC,
+    seed: int | None = None,
+) -> Image.Image:
+    """
+    Accumule (ADD) n couches blanches issues de `whited` sur un fond noir `black_bg`.
+
+    - À chaque itération:
+        1) alpha = luminance(whited)  [seuil/feather optionnels]
+        2) couche RGBA blanche (255,255,255, alpha)
+        3) scale + rotate (expand=True)
+        4) placement (x,y) aléatoire dans le cadre
+        5) accumulation par ADD (clip 255) sur un canevas 'acc'
+
+    - Retourne une image RGBA : black_bg + acc.
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    # S'assure que le fond et le canevas ont la même taille
+    BW, BH = black_bg.size
+    base = black_bg.convert("RGBA")
+    acc  = Image.new("RGBA", (BW, BH), (0, 0, 0, 0))
+
+    # Préparer la source alpha (on n'utilise QUE l'alpha dérivé du mask)
+    src_alpha = whited.convert("L")
+    if threshold is not None:
+        t = max(0, min(255, int(threshold)))
+        src_alpha = src_alpha.point(lambda v: 255 if v >= t else 0, mode="L")
+
+    if feather_edge and feather_edge > 0:
+        src_alpha = src_alpha.filter(ImageFilter.GaussianBlur(float(feather_edge)))
+
+    # Couche blanche “canonique” (RGB = blanc, alpha = src_alpha)
+    # On crée une fonction utilitaire pour construire la couche (utile après resize/rotate)
+    def make_white_layer(alpha_img: Image.Image) -> Image.Image:
+        Lw, Lh = alpha_img.size
+        layer = Image.new("RGBA", (Lw, Lh), (255, 255, 255, 0))
+        layer.putalpha(alpha_img)
+        return layer
+
+    # Boucle d'accumulation
+    for _ in range(max(0, int(n))):
+        # 1) Scale aléatoire de l'alpha
+        s = random.uniform(*scale_range)
+        a_scaled = src_alpha.resize(
+            (max(1, int(src_alpha.width  * s)),
+             max(1, int(src_alpha.height * s))),
+            resample=resample_scale
+        )
+
+        # 2) Rotation aléatoire (expand=True) – on tourne l'alpha
+        angle = random.uniform(*angle_range)
+        a_rot = a_scaled.rotate(angle, resample=resample_rotate, expand=True, fillcolor=0)
+
+        # 3) Couche blanche correspondante
+        layer = make_white_layer(a_rot)
+        LW, LH = layer.size
+
+        # 4) Si la couche ne tient pas, on la redimensionne pour qu'elle rentre
+        if LW > BW or LH > BH:
+            fit = min(BW / LW, BH / LH)
+            if fit < 1:
+                newW = max(1, int(LW * fit))
+                newH = max(1, int(LH * fit))
+                a_rot = a_rot.resize((newW, newH), resample=resample_scale)
+                layer = make_white_layer(a_rot)
+                LW, LH = layer.size
+
+        if LW > BW or LH > BH:
+            continue  # cas extrême, on saute
+
+        # 5) Coordonnées aléatoires valides
+        x = random.randint(0, BW - LW) if BW > LW else 0
+        y = random.randint(0, BH - LH) if BH > LH else 0
+
+        # 6) Accumulation ADD : on fabrique un patch pleine taille et on ADD par canal
+        patch = Image.new("RGBA", (BW, BH), (0, 0, 0, 0))
+        patch.alpha_composite(layer, dest=(x, y))
+
+        r1, g1, b1, a1 = acc.split()
+        r2, g2, b2, a2 = patch.split()
+        r = ImageChops.add(r1, r2)   # addition, clip 255
+        g = ImageChops.add(g1, g2)
+        b = ImageChops.add(b1, b2)
+        # Pour l’alpha : on prend le max (préserve les contours déjà en place)
+        a = ImageChops.lighter(a1, a2)
+
+        acc = Image.merge("RGBA", (r, g, b, a))
+
+    # Pose finale sur le fond noir (utile si black_bg n'est pas pur noir opaque)
+    out = base.copy()
+    out.alpha_composite(acc)
+    return out
+
+def apply_composite_mask(
+    base: Image.Image,
+    blacked: Image.Image,
+    *,
+    match_size: bool = True,
+    resample = Image.Resampling.NEAREST,  # NEAREST = masque net ; BICUBIC si tu redimensionnes du gris
+    threshold: int | None = 200,          # binarise le masque : >= seuil -> 255 (blanc=base), < seuil -> 0 (noir=fond)
+    feather: float = 0.0,                 # adoucit le bord du masque (flou gaussien)
+    invert_mask: bool = False,            # inverse la logique si besoin
+    white_color: tuple[int,int,int] = (255, 255, 255)  # couleur de fond à la place du “noir”
+) -> Image.Image:
+    """
+    Sortie:
+      - zones BLANCHES de `blacked` => image `base`
+      - zones NOIRES   de `blacked` => `white_color` (par défaut: blanc)
+
+    Paramètres utiles:
+      - threshold: None pour garder un masque en niveaux de gris (transition douce),
+                   ou une valeur 0..255 pour un bord net (binaire).
+      - feather: >0 pour flouter le masque et créer des contours plus doux.
+    """
+    # 1) Préparer le masque à partir de `blacked`
+    mask = blacked.convert("L")
+
+    if threshold is not None:
+        t = max(0, min(255, int(threshold)))
+        mask = mask.point(lambda v: 255 if v >= t else 0, mode="L")
+
+    if invert_mask:
+        mask = ImageOps.invert(mask)
+
+    if feather and feather > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(float(feather)))
+
+    # 2) Préparer les deux “couches” : base et fond blanc (ou autre couleur)
+    base_rgb = base.convert("RGB")
+    white_bg = Image.new("RGB", base_rgb.size, white_color)
+
+    # 3) Composer: là où mask est clair → prend base, sinon → prend white_bg
+    out = Image.composite(base_rgb, white_bg, mask)
+    return out

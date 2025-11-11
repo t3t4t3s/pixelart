@@ -1,4 +1,4 @@
-from PIL import Image, ImageFilter, ImageOps, ImageChops
+from PIL import Image, ImageFilter, ImageOps, ImageChops, ImageStat
 import random
 from typing import Tuple
 
@@ -615,3 +615,90 @@ def apply_composite_mask(
     # 3) Composer: là où mask est clair → prend base, sinon → prend white_bg
     out = Image.composite(base_rgb, white_bg, mask)
     return out
+
+def export_for_web(
+    img: Image.Image,
+    out_basename: str,
+    widths=(384, 640, 1024, 1440),
+    prefer_lossless_if_graphic=True,
+    lossy_quality=82,
+    lossless_effort=6,      # 0..6 (plus lent => plus petit)
+    strip_metadata=True,
+    jpeg_fallback=False
+):
+    im = img.copy()
+    has_alpha = ("A" in im.getbands())
+
+    # Heuristique simple “graphique vs photo”
+    is_graphic = False
+    if prefer_lossless_if_graphic:
+        pal = im.convert("RGB").quantize(colors=64, method=Image.Quantize.FASTOCTREE)
+        unique = pal.getcolors(maxcolors=1_000_000)
+        uniq_count = len(unique) if unique else 1_000_000
+        var = ImageStat.Stat(im.convert("L")).var[0]
+        is_graphic = (uniq_count < 128) and (var < 4000)
+
+    # Préparer params d’enregistrement WebP
+    save_params_webp = {}
+    if not strip_metadata:
+        # ne passer les meta QUE si elles existent
+        exif = im.info.get("exif")
+        icc  = im.info.get("icc_profile")
+        if exif:
+            save_params_webp["exif"] = exif
+        if icc:
+            save_params_webp["icc_profile"] = icc
+    # sinon: on ne met AUCUNE clé meta → elles seront absentes
+
+    # Base de nom
+    base = out_basename.rsplit(".", 1)[0]
+    paths = []
+
+    src_w, src_h = im.size
+    for w in widths:
+        target_w = min(max(1, int(w)), src_w)  # ne pas agrandir
+        target_h = max(1, round(src_h * (target_w / src_w)))
+        im_resized = im.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+        webp_path = f"{base}-{target_w}.webp"
+        if is_graphic:
+            im_resized.save(
+                webp_path,
+                format="WEBP",
+                lossless=True,
+                method=lossless_effort,
+                **save_params_webp
+            )
+        else:
+            im_resized.save(
+                webp_path,
+                format="WEBP",
+                quality=lossy_quality,
+                method=6,
+                exact=has_alpha,  # préserve précisément les bords transparents
+                **save_params_webp
+            )
+        paths.append(webp_path)
+
+        # Fallback JPEG (seulement si pas d’alpha)
+        if jpeg_fallback and not has_alpha:
+            jpg_path = f"{base}-{target_w}.jpg"
+            jpg_params = dict(
+                format="JPEG",
+                quality=85,
+                optimize=True,
+                progressive=True,
+                subsampling=0
+            )
+            if not strip_metadata:
+                exif = im.info.get("exif")
+                icc  = im.info.get("icc_profile")
+                if exif:
+                    jpg_params["exif"] = exif
+                if icc:
+                    jpg_params["icc_profile"] = icc
+
+            im_resized.convert("RGB").save(jpg_path, **jpg_params)
+            paths.append(jpg_path)
+
+    return paths

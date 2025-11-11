@@ -702,3 +702,112 @@ def export_for_web(
             paths.append(jpg_path)
 
     return paths
+
+def prep_and_chops(
+    img1: Image.Image,
+    img2: Image.Image,
+    op: str = "add",
+    *,
+    # Préparation
+    mode: str | None = None,          # None => auto ("RGBA" si alpha, sinon "RGB" pour couleurs, "L" si niveaux de gris)
+    size_strategy: str = "pad",       # "pad" (par défaut) ou "resize"
+    align: str = "center",            # pour "pad": "topleft"|"top"|"topright"|"left"|"center"|"right"|"bottomleft"|"bottom"|"bottomright"
+    resample=Image.BICUBIC,           # pour "resize"
+    pad_fill=0,                       # couleur du fond pour "pad" (0 noir, ou tuple ex (0,0,0,0) en RGBA)
+
+    # Paramètres passés à certaines ops
+    scale: float = 1.0,               # pour add/subtract
+    offset: int = 0                   # pour add/subtract
+) -> tuple[Image.Image, Image.Image, Image.Image]:
+    """
+    Retourne (img1_prep, img2_prep, result).
+    """
+
+    # -------- 1) Harmoniser le mode --------
+    def auto_mode(a: Image.Image, b: Image.Image) -> str:
+        # Si l’une a un canal alpha -> RGBA
+        if ("A" in a.getbands()) or ("A" in b.getbands()):
+            return "RGBA"
+        # Si l’une est couleur -> RGB
+        if a.mode not in ("1","L") or b.mode not in ("1","L"):
+            return "RGB"
+        # Sinon niveaux de gris
+        return "L"
+
+    target_mode = mode or auto_mode(img1, img2)
+    A = img1.convert(target_mode)
+    B = img2.convert(target_mode)
+
+    # -------- 2) Harmoniser la taille --------
+    w1, h1 = A.size
+    w2, h2 = B.size
+
+    if size_strategy not in ("pad", "resize"):
+        raise ValueError("size_strategy doit être 'pad' ou 'resize'.")
+
+    if size_strategy == "resize":
+        # on choisit la plus grande taille pour minimiser la perte
+        W, H = max(w1, w2), max(h1, h2)
+        A2 = A.resize((W, H), resample=resample)
+        B2 = B.resize((W, H), resample=resample)
+    else:
+        # "pad" : on crée des toiles de même taille et on y colle les images sans déformation
+        W, H = max(w1, w2), max(h1, h2)
+
+        def anchor_xy(w, h, W, H, where: str):
+            table = {
+                "topleft":      (0, 0),
+                "top":          ((W - w)//2, 0),
+                "topright":     (W - w, 0),
+                "left":         (0, (H - h)//2),
+                "center":       ((W - w)//2, (H - h)//2),
+                "right":        (W - w, (H - h)//2),
+                "bottomleft":   (0, H - h),
+                "bottom":       ((W - w)//2, H - h),
+                "bottomright":  (W - w, H - h),
+            }
+            return table.get(where, table["center"])
+
+        # couleur de fond adaptée au mode
+        if isinstance(pad_fill, tuple):
+            bg = pad_fill
+        else:
+            # si RGBA -> tuple (pad_fill, pad_fill, pad_fill, pad_fill?) ; on met alpha 0 si fill est un int
+            if target_mode == "RGBA":
+                bg = (pad_fill, pad_fill, pad_fill, 0 if isinstance(pad_fill, int) else pad_fill)
+            elif target_mode == "RGB":
+                bg = (pad_fill, pad_fill, pad_fill)
+            else:
+                bg = pad_fill
+
+        canvasA = Image.new(target_mode, (W, H), bg)
+        canvasB = Image.new(target_mode, (W, H), bg)
+
+        ax, ay = anchor_xy(w1, h1, W, H, align)
+        bx, by = anchor_xy(w2, h2, W, H, align)
+        canvasA.paste(A, (ax, ay))
+        canvasB.paste(B, (bx, by))
+
+        A2, B2 = canvasA, canvasB
+
+    # -------- 3) Opération ImageChops --------
+    ops = {
+        "add":             lambda x, y: ImageChops.add(x, y, scale=scale, offset=offset),
+        "subtract":        lambda x, y: ImageChops.subtract(x, y, scale=scale, offset=offset),
+        "difference":      lambda x, y: ImageChops.difference(x, y),
+        "multiply":        lambda x, y: ImageChops.multiply(x, y),
+        "screen":          lambda x, y: ImageChops.screen(x, y),
+        "lighter":         lambda x, y: ImageChops.lighter(x, y),
+        "darker":          lambda x, y: ImageChops.darker(x, y),
+        "add_modulo":      lambda x, y: ImageChops.add_modulo(x, y),
+        "subtract_modulo": lambda x, y: ImageChops.subtract_modulo(x, y),
+        # logiques : nécessitent généralement "1" ou "L"
+        "logical_and":     lambda x, y: ImageChops.logical_and(x.convert("1"), y.convert("1")),
+        "logical_or":      lambda x, y: ImageChops.logical_or(x.convert("1"), y.convert("1")),
+        "logical_xor":     lambda x, y: ImageChops.logical_xor(x.convert("1"), y.convert("1")),
+    }
+    if op not in ops:
+        raise ValueError(f"Opération inconnue '{op}'. Choisissez parmi: {', '.join(ops.keys())}")
+
+    result = ops[op](A2, B2)
+    return A2, B2, result
